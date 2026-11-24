@@ -31,7 +31,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
 
-/** Profile pictures are stored only on this phone, one small square JPEG per account. */
+/** Profile pictures are stored only on the device, one small square JPEG per account. */
 class AvatarStore(private val context: Context) {
     private val dir = File(context.filesDir, "avatars").apply { mkdirs() }
     private val syncPrefs = context.getSharedPreferences("avatar_sync", Context.MODE_PRIVATE)
