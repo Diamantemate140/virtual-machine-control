@@ -3,11 +3,11 @@
 A small material 3 expressive andorid app to turn on and off your libvirt QEMU/KVM machines
 
 ## Features
-  Power button for your vms
-  Per-user VM control
-  Access to the machines console
-  Admins can control the machines resources (coming soon)
-  Auto console resizing 
+  <p>Power button for your vms</p>
+  <p>Per-user VM control</p>
+  <p>Access to the machines console</p>
+  <p>Admins can control the machines resources (coming soon)</p>
+  <p>Auto console resizing</p> 
   
   
 <img width="100" alt="Screenshot_20261124-215429" src="https://github.com/user-attachments/assets/91848915-ca6f-4b35-844a-7f23978a942a" />
