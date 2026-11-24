@@ -1,6 +1,7 @@
 package pet.toasty.vmpowerphone
 
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import okhttp3.*
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
@@ -9,6 +10,7 @@ import java.io.DataInputStream
 import java.io.InputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.atomic.AtomicLong
 import java.util.zip.Inflater
 import javax.crypto.Cipher
 import javax.crypto.spec.SecretKeySpec
@@ -16,6 +18,12 @@ import kotlin.concurrent.thread
 
 const val NEED_PASSWORD = "NEED_PASSWORD"
 const val WRONG_PASSWORD = "WRONG_PASSWORD"
+
+// Encoding choices (see Settings)
+const val ENC_RAW = 0
+const val ENC_ZRLE = 1
+const val ENC_TIGHT = 2
+const val ENC_AUTO = 3
 
 private val EOF = ByteArray(0)
 
@@ -57,12 +65,17 @@ class VncClient(
     private val password: String?,
     private val quality: Int,
     private val compression: Int,
+    private val encoding: Int,
     private val onFrame: () -> Unit,
     private val onResizeSupported: () -> Unit,
     private val onEnd: (String) -> Unit
 ) {
     @Volatile var bitmap: Bitmap? = null
     @Volatile var resizeSupported = false
+    // Live numbers for the stats line in the console
+    val bytesIn = AtomicLong()
+    val frames = AtomicLong()
+    @Volatile var lastEncoding = ""
     @Volatile private var stopped = false
     @Volatile private var screenId = 0
     @Volatile private var screenFlags = 0
@@ -72,15 +85,20 @@ class VncClient(
     private var lastX = 0
     private var lastY = 0
 
-    private val bpp = bitsForQuality(quality)
+    // Tight needs 24-bit pixels. Otherwise the quality slider picks the colour depth.
+    private val bpp = if (encoding == ENC_TIGHT) 32 else bitsForQuality(quality)
     private val bytesPP = bpp / 8
     private val cpSize = if (bpp == 32) 3 else bpp / 8   // ZRLE "CPIXEL" size
-    private val inflater = Inflater()
+    private val inflater = Inflater()                     // ZRLE
+    private val tightStreams = Array(4) { Inflater() }    // Tight keeps four zlib streams
 
     fun start() {
         val req = Request.Builder().url(url).header("Authorization", "Bearer $token").build()
         ws = http.newWebSocket(req, object : WebSocketListener() {
-            override fun onMessage(webSocket: WebSocket, bytes: ByteString) { input.push(bytes.toByteArray()) }
+            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                bytesIn.addAndGet(bytes.size.toLong())
+                input.push(bytes.toByteArray())
+            }
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { input.finish() }
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 input.finish()
@@ -99,6 +117,7 @@ class VncClient(
                 if (!stopped) onEnd(e.message ?: "Disconnected")
             } finally {
                 try { inflater.end() } catch (e: Exception) { }
+                tightStreams.forEach { try { it.end() } catch (e: Exception) { } }
             }
         }
     }
@@ -209,14 +228,18 @@ class VncClient(
 
         send(pixelFormatMessage())
 
-        // Encodings in order of preference. 16 = ZRLE, 1 = CopyRect, 0 = Raw,
-        // -223 DesktopSize, -308 ExtendedDesktopSize,
+        // Encodings in order of preference (the server uses the first one it supports):
+        // 7 = Tight, 16 = ZRLE, 1 = CopyRect, 0 = Raw, -223 DesktopSize, -308 ExtendedDesktopSize,
         // -32..-23 quality level hint, -256..-247 compression level hint.
         val encs = mutableListOf<Int>()
-        if (compression > 0) encs.add(16)
+        when (encoding) {
+            ENC_TIGHT, ENC_AUTO -> { if (bpp == 32) encs.add(7); encs.add(16) }
+            ENC_ZRLE -> encs.add(16)
+            else -> {}
+        }
         encs.add(1); encs.add(0); encs.add(-223); encs.add(-308)
         encs.add(-32 + quality.coerceIn(0, 9))
-        if (compression > 0) encs.add(-256 + compression.coerceIn(0, 9))
+        if (encoding != ENC_RAW) encs.add(-256 + compression.coerceIn(0, 9))
         send(ByteBuffer.allocate(4 + 4 * encs.size).apply {
             put(2); put(0); putShort(encs.size.toShort())
             encs.forEach { putInt(it) }
@@ -238,7 +261,15 @@ class VncClient(
                         val ry = din.readUnsignedShort()
                         val rw = din.readUnsignedShort()
                         val rh = din.readUnsignedShort()
-                        when (val enc = din.readInt()) {
+                        val enc = din.readInt()
+                        lastEncoding = when (enc) {
+                            0 -> "Raw"
+                            1 -> "CopyRect"
+                            7 -> "Tight"
+                            16 -> "ZRLE"
+                            else -> lastEncoding
+                        }
+                        when (enc) {
                             0 -> {
                                 val bmp = bitmap!!
                                 val buf = ByteArray(rw * rh * bytesPP); din.readFully(buf)
@@ -257,6 +288,7 @@ class VncClient(
                                 bmp.setPixels(tmp, 0, rw, rx, ry, rw, rh)
                             }
                             16 -> decodeZrle(din, rx, ry, rw, rh)
+                            7 -> decodeTight(din, rx, ry, rw, rh)
                             -223 -> {
                                 w = rw; h = rh
                                 bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
@@ -285,6 +317,7 @@ class VncClient(
                             else -> error("Unsupported encoding $enc")
                         }
                     }
+                    frames.incrementAndGet()
                     onFrame()
                     requestUpdate(!needFull, w, h)
                     needFull = false
@@ -384,6 +417,131 @@ class VncClient(
             }
             ty += 64
         }
+    }
+
+    // ---- Tight ----
+
+    private fun readCompactLen(din: DataInputStream): Int {
+        var len = din.readUnsignedByte()
+        if ((len and 0x80) != 0) {
+            val b2 = din.readUnsignedByte()
+            len = (len and 0x7F) or ((b2 and 0x7F) shl 7)
+            if ((b2 and 0x80) != 0) len = len or (din.readUnsignedByte() shl 14)
+        }
+        return len
+    }
+
+    private fun inflateExact(inf: Inflater, comp: ByteArray, expected: Int): ByteArray {
+        inf.setInput(comp)
+        val out = ByteArray(expected)
+        var off = 0
+        while (off < expected) {
+            val n = inf.inflate(out, off, expected - off)
+            if (n > 0) off += n
+            else if (inf.needsInput() || inf.finished() || inf.needsDictionary()) break
+        }
+        if (off < expected) error("Bad Tight data")
+        // Consume the zlib sync-flush marker so the stream stays in step with the server
+        val scratch = ByteArray(64)
+        while (inf.inflate(scratch) > 0) { }
+        return out
+    }
+
+    private fun rgb(r: Int, g: Int, b: Int): Int =
+        0xFF000000.toInt() or ((r and 255) shl 16) or ((g and 255) shl 8) or (b and 255)
+
+    /** Tight: fill, JPEG, or zlib-compressed pixels with an optional palette or gradient filter. */
+    private fun decodeTight(din: DataInputStream, rx: Int, ry: Int, rw: Int, rh: Int) {
+        if (bpp != 32) error("Tight needs 24-bit color")
+        val ctrl = din.readUnsignedByte()
+        for (i in 0 until 4) {
+            if (((ctrl shr i) and 1) != 0) tightStreams[i].reset()
+        }
+        val bmp = bitmap ?: return
+        val fits = rx + rw <= bmp.width && ry + rh <= bmp.height
+        val type = ctrl shr 4
+
+        if (type == 8) {                                   // fill with one colour
+            val color = rgb(din.readUnsignedByte(), din.readUnsignedByte(), din.readUnsignedByte())
+            if (fits) bmp.setPixels(IntArray(rw * rh) { color }, 0, rw, rx, ry, rw, rh)
+            return
+        }
+        if (type == 9) {                                   // JPEG
+            val len = readCompactLen(din)
+            val data = ByteArray(len)
+            din.readFully(data)
+            val jpg = BitmapFactory.decodeByteArray(data, 0, len)
+            if (jpg != null) {
+                if (fits) android.graphics.Canvas(bmp).drawBitmap(jpg, rx.toFloat(), ry.toFloat(), null)
+                jpg.recycle()
+            }
+            return
+        }
+        if (type > 9) error("Bad Tight control byte")
+
+        val streamId = type and 3
+        var filter = 0
+        if ((type and 4) != 0) filter = din.readUnsignedByte()
+
+        var palette: IntArray? = null
+        val dataSize: Int
+        when (filter) {
+            0, 2 -> dataSize = rw * rh * 3
+            1 -> {
+                val n = din.readUnsignedByte() + 1
+                palette = IntArray(n) { rgb(din.readUnsignedByte(), din.readUnsignedByte(), din.readUnsignedByte()) }
+                dataSize = if (n == 2) ((rw + 7) / 8) * rh else rw * rh
+            }
+            else -> error("Unknown Tight filter")
+        }
+
+        val data: ByteArray = if (dataSize < 12) {
+            ByteArray(dataSize).also { din.readFully(it) }         // too small to compress
+        } else {
+            val len = readCompactLen(din)
+            val comp = ByteArray(len)
+            din.readFully(comp)
+            inflateExact(tightStreams[streamId], comp, dataSize)
+        }
+
+        val px = IntArray(rw * rh)
+        when (filter) {
+            0 -> for (i in px.indices) {
+                val o = i * 3
+                px[i] = rgb(data[o].toInt(), data[o + 1].toInt(), data[o + 2].toInt())
+            }
+            1 -> {
+                val pal = palette!!
+                if (pal.size == 2) {
+                    val rowBytes = (rw + 7) / 8
+                    for (y in 0 until rh) for (x in 0 until rw) {
+                        val bit = (data[y * rowBytes + x / 8].toInt() shr (7 - x % 8)) and 1
+                        px[y * rw + x] = pal[bit]
+                    }
+                } else {
+                    for (i in px.indices) px[i] = pal[(data[i].toInt() and 255).coerceAtMost(pal.size - 1)]
+                }
+            }
+            2 -> {
+                // Gradient filter: each value is stored as the difference from left + up - upper-left
+                val prev = IntArray(rw * 3)
+                val cur = IntArray(rw * 3)
+                for (y in 0 until rh) {
+                    for (x in 0 until rw) {
+                        for (c in 0 until 3) {
+                            val left = if (x > 0) cur[(x - 1) * 3 + c] else 0
+                            val up = if (y > 0) prev[x * 3 + c] else 0
+                            val upLeft = if (x > 0 && y > 0) prev[(x - 1) * 3 + c] else 0
+                            val pred = (left + up - upLeft).coerceIn(0, 255)
+                            cur[x * 3 + c] = ((data[(y * rw + x) * 3 + c].toInt() and 255) + pred) and 255
+                        }
+                        px[y * rw + x] = rgb(cur[x * 3], cur[x * 3 + 1], cur[x * 3 + 2])
+                    }
+                    System.arraycopy(cur, 0, prev, 0, rw * 3)
+                }
+            }
+        }
+        if (fits) bmp.setPixels(px, 0, rw, rx, ry, rw, rh)
     }
 
     private fun requestUpdate(incremental: Boolean, w: Int, h: Int) {

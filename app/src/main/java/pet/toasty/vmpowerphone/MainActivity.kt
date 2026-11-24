@@ -14,6 +14,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -33,6 +34,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.rotate
@@ -43,7 +45,8 @@ import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
@@ -180,8 +183,9 @@ private fun Morph.toComposePath(progress: Float): Path {
 
 @Composable
 fun MorphBackground(content: @Composable BoxScope.() -> Unit) {
-    val haptic = LocalHapticFeedback.current
+    val haptic = LocalHaptics.current
     val scheme = MaterialTheme.colorScheme
+    val dark = isSystemInDarkTheme()
 
     val shapes = remember {
         listOf(
@@ -192,12 +196,6 @@ fun MorphBackground(content: @Composable BoxScope.() -> Unit) {
             RoundedPolygon.star(12, 1f, 0.8f, CornerRounding(0.2f)),
         )
     }
-    val colors = listOf(
-        scheme.primaryContainer,
-        scheme.tertiaryContainer,
-        scheme.secondaryContainer,
-        scheme.primary
-    )
     val blobs = remember {
         listOf(
             Blob(0.15f, 0.20f, 0.55f, 5200, 9000, 24000, 0.30f, Morph(shapes[0], shapes[1])),
@@ -229,6 +227,8 @@ fun MorphBackground(content: @Composable BoxScope.() -> Unit) {
             label = "spin"
         )
     }
+    // Morph paths are computed once per frame and shared by the background and every glass element
+    val paths = remember { derivedStateOf { blobs.mapIndexed { i, b -> b.morph.toComposePath(progress[i].value) } } }
 
     var touch by remember { mutableStateOf<Offset?>(null) }
     var lastTouch by remember { mutableStateOf(Offset.Zero) }
@@ -238,63 +238,80 @@ fun MorphBackground(content: @Composable BoxScope.() -> Unit) {
         label = "pull"
     )
 
-    Box(
-        Modifier
-            .fillMaxSize()
-            .pointerInput(Unit) {
-                awaitPointerEventScope {
-                    var accumulated = 0f
-                    var previous: Offset? = null
-                    while (true) {
-                        val event = awaitPointerEvent(PointerEventPass.Initial)
-                        if (consoleActive.value) {
-                            touch = null
-                            previous = null
-                            accumulated = 0f
-                            continue
-                        }
-                        val down = event.changes.firstOrNull { it.pressed }
-                        if (down != null) {
-                            touch = down.position
-                            lastTouch = down.position
-                            if (previous == null) {
-                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            } else {
-                                accumulated += (down.position - previous).getDistance()
-                                if (accumulated > 90f) {
-                                    accumulated = 0f
-                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                }
-                            }
-                            previous = down.position
-                        } else {
-                            touch = null
-                            previous = null
-                            accumulated = 0f
-                        }
-                    }
-                }
-            }
-    ) {
-        Canvas(Modifier.fillMaxSize()) {
+    // The whole background as one drawable. Blobs are kept dim so text on top stays readable
+    // in both light and dark mode.
+    val backdrop = remember(scheme, dark) {
+        val tints = listOf(scheme.primaryContainer, scheme.tertiaryContainer, scheme.secondaryContainer, scheme.primary)
+        val alphas = if (dark) listOf(0.32f, 0.28f, 0.28f, 0.16f) else listOf(0.42f, 0.38f, 0.38f, 0.22f)
+        val base = scheme.background
+        Backdrop { w, h ->
+            drawRect(base, size = Size(w, h))
             blobs.forEachIndexed { i, b ->
-                val radius = size.width * b.size
+                val radius = w * b.size
                 val angle = drift[i].value
-                var cx = size.width * b.baseX + kotlin.math.cos(angle) * size.width * 0.07f
-                var cy = size.height * b.baseY + kotlin.math.sin(angle * 0.8f) * size.height * 0.05f
+                var cx = w * b.baseX + kotlin.math.cos(angle) * w * 0.07f
+                var cy = h * b.baseY + kotlin.math.sin(angle * 0.8f) * h * 0.05f
                 cx += (lastTouch.x - cx) * b.pull * pullAmount
                 cy += (lastTouch.y - cy) * b.pull * pullAmount
-                val path = b.morph.toComposePath(progress[i].value)
                 translate(cx, cy) {
                     rotate(spin[i].value, Offset.Zero) {
                         scale(radius * (1f + 0.12f * pullAmount), Offset.Zero) {
-                            drawPath(path, colors[i].copy(alpha = 0.55f))
+                            drawPath(paths.value[i], tints[i].copy(alpha = alphas[i]))
                         }
                     }
                 }
             }
+            drawRect(base.copy(alpha = 0.20f), size = Size(w, h))
         }
-        content()
+    }
+
+    CompositionLocalProvider(
+        LocalBackdrop provides backdrop,
+        // Text outside of cards would otherwise default to black, which is unreadable in dark mode
+        LocalContentColor provides scheme.onBackground
+    ) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .onSizeChanged { backdrop.size = Size(it.width.toFloat(), it.height.toFloat()) }
+                .pointerInput(Unit) {
+                    awaitPointerEventScope {
+                        var accumulated = 0f
+                        var previous: Offset? = null
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            if (consoleActive.value) {
+                                touch = null
+                                previous = null
+                                accumulated = 0f
+                                continue
+                            }
+                            val down = event.changes.firstOrNull { it.pressed }
+                            if (down != null) {
+                                touch = down.position
+                                lastTouch = down.position
+                                if (previous == null) {
+                                    haptic.bgTick()
+                                } else {
+                                    accumulated += (down.position - previous).getDistance()
+                                    if (accumulated > 90f) {
+                                        accumulated = 0f
+                                        haptic.bgTick()
+                                    }
+                                }
+                                previous = down.position
+                            } else {
+                                touch = null
+                                previous = null
+                                accumulated = 0f
+                            }
+                        }
+                    }
+                }
+        ) {
+            Canvas(Modifier.fillMaxSize()) { backdrop.draw(this, size.width, size.height) }
+            content()
+        }
     }
 }
 
@@ -314,6 +331,11 @@ fun Root() {
     var avatarTick by remember { mutableIntStateOf(0) }
     var linkBusy by remember { mutableStateOf(false) }
     var linkError by remember { mutableStateOf<String?>(null) }
+
+    val view = LocalView.current
+    val haptics = remember(view) { Haptics(view, context.applicationContext) }
+    haptics.enabled = settings.haptics
+    haptics.backgroundEnabled = settings.bgHaptics
 
     fun update(s: Accounts) {
         store.save(s)
@@ -366,6 +388,10 @@ fun Root() {
         avatarTick++
     }
 
+    CompositionLocalProvider(
+        LocalHaptics provides haptics,
+        LocalGlassOn provides settings.glass
+    ) {
     MorphBackground {
         val current = state.current
         if (current == null || adding) {
@@ -406,20 +432,24 @@ fun Root() {
         }
     }
 
+    }
+
     // A vmpower://login link was opened: ask before adding it
     val link = pendingLink.value
     if (link != null) {
         val parsed = parseLoginLink(link)
         if (parsed == null) {
             AlertDialog(
+                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.95f),
                 onDismissRequest = { pendingLink.value = null },
                 title = { Text("Invalid login link") },
                 text = { Text("That link couldn't be read.") },
-                confirmButton = { TextButton(onClick = { pendingLink.value = null }) { Text("OK") } }
+                confirmButton = { ExpressiveTextButton(onClick = { pendingLink.value = null }) { Text("OK") } }
             )
         } else {
             val (server, token) = parsed
             AlertDialog(
+                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.95f),
                 onDismissRequest = { if (!linkBusy) { pendingLink.value = null; linkError = null } },
                 title = { Text("Add account?") },
                 text = {
@@ -430,7 +460,7 @@ fun Root() {
                     }
                 },
                 confirmButton = {
-                    TextButton(enabled = !linkBusy, onClick = {
+                    ExpressiveTextButton(enabled = !linkBusy, onClick = {
                         scope.launch {
                             linkBusy = true
                             linkError = null
@@ -446,7 +476,7 @@ fun Root() {
                     }) { Text(if (linkBusy) "Checking..." else "Add account") }
                 },
                 dismissButton = {
-                    TextButton(enabled = !linkBusy, onClick = { pendingLink.value = null; linkError = null }) {
+                    ExpressiveTextButton(enabled = !linkBusy, onClick = { pendingLink.value = null; linkError = null }) {
                         Text("Cancel")
                     }
                 }
@@ -474,22 +504,32 @@ private fun SignedIn(
     val pager = rememberPagerState(pageCount = { 3 })
     val scope = rememberCoroutineScope()
     val inConsole = consoleActive.value
+    val haptic = LocalHaptics.current
+    var lastPage by remember { mutableIntStateOf(pager.currentPage) }
+    LaunchedEffect(pager.currentPage) {
+        if (pager.currentPage != lastPage) {
+            lastPage = pager.currentPage
+            haptic.tick()
+        }
+    }
 
     Scaffold(
         containerColor = Color.Transparent,
+        contentColor = MaterialTheme.colorScheme.onBackground,
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         bottomBar = {
             if (!inConsole) {
-                NavigationBar(
-                    containerColor = MaterialTheme.colorScheme.surfaceContainer.copy(alpha = 0.94f)
-                ) {
+                GlassNavigationBar {
                     listOf(
                         Icons.Rounded.Computer to "VMs",
                         Icons.Rounded.Person to "Accounts",
                         Icons.Rounded.Settings to "Settings"
                     )
                         .forEachIndexed { i, (icon, label) ->
+                            val navSource = remember { MutableInteractionSource() }
                             NavigationBarItem(
+                                modifier = Modifier.squish(navSource),
+                                interactionSource = navSource,
                                 selected = pager.currentPage == i,
                                 onClick = { scope.launch { pager.animateScrollToPage(i) } },
                                 icon = { Icon(icon, contentDescription = label) },
@@ -546,7 +586,7 @@ fun LoginScreen(
     onLogin: suspend (server: String, token: String) -> String?
 ) {
     val scope = rememberCoroutineScope()
-    val haptic = LocalHapticFeedback.current
+    val haptic = LocalHaptics.current
     var linkText by remember { mutableStateOf("") }
     var server by remember { mutableStateOf("") }
     var token by remember { mutableStateOf("") }
@@ -563,13 +603,7 @@ fun LoginScreen(
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Card(
-            shape = MaterialTheme.shapes.extraLarge,
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.85f)
-            ),
-            modifier = Modifier.fillMaxWidth()
-        ) {
+        GlassCard(modifier = Modifier.fillMaxWidth()) {
             Column(
                 Modifier.padding(24.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -615,7 +649,7 @@ fun LoginScreen(
                     visualTransformation = PasswordVisualTransformation(),
                     modifier = Modifier.fillMaxWidth()
                 )
-                Button(
+                ExpressiveButton(
                     onClick = {
                         scope.launch {
                             loading = true
@@ -623,9 +657,9 @@ fun LoginScreen(
                             loading = false
                             if (result != null) {
                                 error = result
-                                haptic.performHapticFeedback(HapticFeedbackType.Reject)
+                                haptic.reject()
                             } else {
-                                haptic.performHapticFeedback(HapticFeedbackType.Confirm)
+                                haptic.confirm()
                             }
                         }
                     },
@@ -636,7 +670,7 @@ fun LoginScreen(
                     else Text("Sign in", style = MaterialTheme.typography.titleMedium)
                 }
                 if (canCancel) {
-                    TextButton(
+                    ExpressiveTextButton(
                         onClick = onCancel,
                         modifier = Modifier.heightIn(min = 52.dp)
                     ) { Text("Cancel", style = MaterialTheme.typography.titleMedium) }
@@ -661,7 +695,7 @@ fun VmScreen(
     val server = account.server
     val token = account.token
     val scope = rememberCoroutineScope()
-    val haptic = LocalHapticFeedback.current
+    val haptic = LocalHaptics.current
     val snackbar = remember { SnackbarHostState() }
     var groups by remember { mutableStateOf<List<VmGroup>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
@@ -713,7 +747,7 @@ fun VmScreen(
                 "Failed: ${e.message}"
             }
             busy = false
-            haptic.performHapticFeedback(if (ok) HapticFeedbackType.Confirm else HapticFeedbackType.Reject)
+            if (ok) haptic.confirm() else haptic.reject()
             scope.launch { delay(1500); loadStatus() }
             snackbar.showSnackbar(msg)
         }
@@ -745,17 +779,18 @@ fun VmScreen(
 
     confirmStop?.let { action ->
         AlertDialog(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.95f),
             onDismissRequest = { confirmStop = null },
             title = { Text("Force off $pendingTitle?") },
             text = { Text("This cuts power to the VM immediately. Unsaved data may be lost.") },
             confirmButton = {
-                TextButton(
+                ExpressiveTextButton(
                     onClick = { confirmStop = null; run(action, pendingTitle) },
                     modifier = Modifier.heightIn(min = 48.dp)
                 ) { Text("Force off", style = MaterialTheme.typography.titleMedium) }
             },
             dismissButton = {
-                TextButton(
+                ExpressiveTextButton(
                     onClick = { confirmStop = null },
                     modifier = Modifier.heightIn(min = 48.dp)
                 ) { Text("Cancel", style = MaterialTheme.typography.titleMedium) }
@@ -768,6 +803,7 @@ fun VmScreen(
     Scaffold(
         modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
         containerColor = Color.Transparent,
+        contentColor = MaterialTheme.colorScheme.onBackground,
         snackbarHost = { SnackbarHost(snackbar) },
         topBar = {
             LargeTopAppBar(
@@ -775,7 +811,7 @@ fun VmScreen(
                 actions = {
                     AccountAvatar(
                         avatars, avatarTick, account, 44.dp,
-                        Modifier.clickable { onAvatarClick() }
+                        Modifier.expressiveClickable { onAvatarClick() }
                     )
                     Spacer(Modifier.width(12.dp))
                 },
@@ -787,8 +823,12 @@ fun VmScreen(
             )
         },
         floatingActionButton = {
-            MediumFloatingActionButton(onClick = {
-                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+            val fabInteraction = remember { MutableInteractionSource() }
+            MediumFloatingActionButton(
+                modifier = Modifier.squish(fabInteraction),
+                interactionSource = fabInteraction,
+                onClick = {
+                haptic.tick()
                 scope.launch { load(); loadStatus() }
             }) {
                 if (loading || busy) LoadingIndicator(Modifier.size(32.dp))
@@ -820,7 +860,6 @@ fun VmScreen(
                     enabled = !busy,
                     onConsole = { consoleVm = group.title },
                     onAction = { action ->
-                        haptic.performHapticFeedback(HapticFeedbackType.ContextClick)
                         pendingTitle = group.title
                         if (action.isStop) confirmStop = action else run(action, group.title)
                     }
@@ -838,40 +877,50 @@ fun VmCard(
     onConsole: () -> Unit,
     onAction: (VmAction) -> Unit
 ) {
-    Card(
-        shape = MaterialTheme.shapes.extraLarge,
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.88f)
-        ),
-        modifier = Modifier.fillMaxWidth()
-    ) {
+    GlassCard(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             Text(group.title, style = MaterialTheme.typography.headlineMedium)
             StatusBadge(status)
+            var pressedIdx by remember { mutableIntStateOf(-1) }
             Row(
                 Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                group.actions.forEach { action ->
-                    val mod = Modifier.weight(1f).heightIn(min = 68.dp)
+                group.actions.forEachIndexed { index, action ->
+                    val w by animateFloatAsState(
+                        targetValue = when {
+                            pressedIdx == index -> 1.3f
+                            pressedIdx >= 0 -> 0.85f
+                            else -> 1f
+                        },
+                        animationSpec = spring(dampingRatio = 0.5f, stiffness = 500f),
+                        label = "actionWidth"
+                    )
+                    val mod = Modifier.weight(w).heightIn(min = 68.dp)
                     val allowed = enabled && actionAllowed(action, status)
                     if (action.isStop) {
-                        FilledTonalButton(
+                        ExpressiveTonalButton(
                             onClick = { onAction(action) },
                             enabled = allowed,
-                            modifier = mod
+                            modifier = mod,
+                            onPressChange = { p ->
+                                pressedIdx = if (p) index else if (pressedIdx == index) -1 else pressedIdx
+                            }
                         ) { Text(action.label, style = MaterialTheme.typography.titleMedium) }
                     } else {
-                        Button(
+                        ExpressiveButton(
                             onClick = { onAction(action) },
                             enabled = allowed,
-                            modifier = mod
+                            modifier = mod,
+                            onPressChange = { p ->
+                                pressedIdx = if (p) index else if (pressedIdx == index) -1 else pressedIdx
+                            }
                         ) { Text(action.label, style = MaterialTheme.typography.titleMedium) }
                     }
                 }
             }
-            OutlinedButton(
+            ExpressiveOutlinedButton(
                 onClick = onConsole,
                 enabled = status?.active ?: true,
                 modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp)

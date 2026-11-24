@@ -288,7 +288,7 @@ private fun Modifier.vncMouse(client: VncClient, map: (Offset) -> Pair<Int, Int>
 
 @Composable
 private fun KeyButton(label: String, onClick: () -> Unit) {
-    OutlinedButton(
+    ExpressiveOutlinedButton(
         onClick = onClick,
         modifier = Modifier.heightIn(min = 52.dp).widthIn(min = 56.dp),
         contentPadding = PaddingValues(horizontal = 18.dp)
@@ -300,13 +300,13 @@ private fun ModKey(label: String, sym: Int, client: VncClient) {
     var on by remember(client) { mutableStateOf(false) }
     val mod = Modifier.heightIn(min = 52.dp).widthIn(min = 64.dp)
     if (on) {
-        FilledTonalButton(
+        ExpressiveTonalButton(
             onClick = { on = false; client.key(sym, false) },
             modifier = mod,
             contentPadding = PaddingValues(horizontal = 18.dp)
         ) { Text(label, style = MaterialTheme.typography.titleMedium) }
     } else {
-        OutlinedButton(
+        ExpressiveOutlinedButton(
             onClick = { on = true; client.key(sym, true) },
             modifier = mod,
             contentPadding = PaddingValues(horizontal = 18.dp)
@@ -340,6 +340,7 @@ fun NativeConsole(
     var canResize by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
     var kbOpen by remember { mutableStateOf(false) }
+    var stats by remember { mutableStateOf("") }
     val cursor = remember { mutableStateOf(Offset.Zero) }
     val scalingNow = rememberUpdatedState(settings.scaling)
 
@@ -356,13 +357,14 @@ fun NativeConsole(
     }
 
     // A new connection is made when quality or compression change
-    val client = remember(attempt, settings.quality, settings.compression) {
+    val client = remember(attempt, settings.quality, settings.compression, settings.encoding) {
         VncClient(
             url = "$server/vnc/$vm",
             token = token,
             password = password,
             quality = settings.quality,
             compression = settings.compression,
+            encoding = settings.encoding,
             onFrame = { status = ""; tick++ },
             onResizeSupported = { canResize = true },
             onEnd = { msg ->
@@ -381,6 +383,29 @@ fun NativeConsole(
     }
     DisposableEffect(client) { client.start(); onDispose { client.stop() } }
     LaunchedEffect(client) { status = "Connecting..." }
+
+    // Live numbers: which encoding the server really uses, data rate and frame rate
+    LaunchedEffect(client, settings.showStats) {
+        if (!settings.showStats) return@LaunchedEffect
+        var lastBytes = client.bytesIn.get()
+        var lastFrames = client.frames.get()
+        while (true) {
+            delay(1000)
+            val bytes = client.bytesIn.get()
+            val frames = client.frames.get()
+            val kb = (bytes - lastBytes) / 1024.0
+            val rate = if (kb >= 1000) "%.1f MB/s".format(kb / 1024.0) else "%.0f kB/s".format(kb)
+            val bmp = client.bitmap
+            stats = listOfNotNull(
+                client.lastEncoding.takeIf { it.isNotEmpty() },
+                rate,
+                "${frames - lastFrames} fps",
+                bmp?.let { "${it.width}x${it.height}" }
+            ).joinToString(" · ")
+            lastBytes = bytes
+            lastFrames = frames
+        }
+    }
 
     // Keep keyboard focus on the console so a physical keyboard works
     LaunchedEffect(needPassword) { if (!needPassword) runCatching { rootFocus.requestFocus() } }
@@ -416,11 +441,12 @@ fun NativeConsole(
         val b = client.bitmap ?: return null
         val v = viewport() ?: return null
         return ((p.x - v.ox) / v.sx).toInt().coerceIn(0, b.width - 1) to
-                ((p.y - v.oy) / v.sy).toInt().coerceIn(0, b.height - 1)
+               ((p.y - v.oy) / v.sy).toInt().coerceIn(0, b.height - 1)
     }
 
     if (showSettings) {
         AlertDialog(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.95f),
             onDismissRequest = { showSettings = false },
             title = { Text("Console settings") },
             text = {
@@ -429,7 +455,7 @@ fun NativeConsole(
                 }
             },
             confirmButton = {
-                TextButton(
+                ExpressiveTextButton(
                     onClick = { showSettings = false },
                     modifier = Modifier.heightIn(min = 48.dp)
                 ) { Text("Done", style = MaterialTheme.typography.titleMedium) }
@@ -451,28 +477,28 @@ fun NativeConsole(
             Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            TextButton(onClick = onClose, modifier = Modifier.heightIn(min = 52.dp)) {
+            ExpressiveTextButton(onClick = onClose, modifier = Modifier.heightIn(min = 52.dp)) {
                 Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
                 Text("Close", style = MaterialTheme.typography.titleMedium)
             }
             Text(
-                status,
+                if (status.isNotEmpty() || !settings.showStats) status else stats,
                 style = MaterialTheme.typography.bodySmall,
                 modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
             )
             if (!needPassword) {
                 if (kbOpen) {
-                    FilledTonalIconButton(onClick = { kbOpen = false }, modifier = Modifier.size(52.dp)) {
+                    ExpressiveIconButton(onClick = { kbOpen = false }, tonal = true, modifier = Modifier.size(52.dp)) {
                         Icon(Icons.Rounded.Keyboard, contentDescription = "Keyboard", modifier = Modifier.size(28.dp))
                     }
                 } else {
-                    IconButton(onClick = { kbOpen = true }, modifier = Modifier.size(52.dp)) {
+                    ExpressiveIconButton(onClick = { kbOpen = true }, modifier = Modifier.size(52.dp)) {
                         Icon(Icons.Rounded.Keyboard, contentDescription = "Keyboard", modifier = Modifier.size(28.dp))
                     }
                 }
             }
-            IconButton(onClick = { showSettings = true }, modifier = Modifier.size(52.dp)) {
+            ExpressiveIconButton(onClick = { showSettings = true }, modifier = Modifier.size(52.dp)) {
                 Icon(Icons.Rounded.Settings, contentDescription = "Console settings", modifier = Modifier.size(28.dp))
             }
         }
@@ -494,7 +520,7 @@ fun NativeConsole(
                     modifier = Modifier.fillMaxWidth()
                 )
                 Spacer(Modifier.height(16.dp))
-                Button(
+                ExpressiveButton(
                     onClick = {
                         prefs.edit().putString(passKey, passwordInput).apply()
                         password = passwordInput

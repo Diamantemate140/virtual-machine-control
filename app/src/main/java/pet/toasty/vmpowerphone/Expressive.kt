@@ -14,7 +14,10 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.LocalIndication
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -178,29 +181,100 @@ fun GlassNavigationBar(content: @Composable RowScope.() -> Unit) {
 // ---------------------------------------------------------------- expressive buttons
 
 /**
- * Material 3 Expressive feel: buttons are pills that spring into a tighter, squarer
- * shape and shrink slightly while pressed, with a haptic click.
+ * Material 3 Expressive feel, squash and stretch:
+ * - hovering with a mouse swells the control a little and loosens its corners
+ * - pressing squashes it (more vertically than horizontally) and tightens the corners
+ * - letting go springs back with a bounce, so it visibly expands past its normal size
  */
 @Composable
-private fun rememberExpressive(interaction: MutableInteractionSource): Pair<Shape, Modifier> {
+private fun rememberExpressive(
+    interaction: MutableInteractionSource,
+    onPressChange: ((Boolean) -> Unit)? = null
+): Pair<Shape, Modifier> {
     val pressed by interaction.collectIsPressedAsState()
+    val hovered by interaction.collectIsHoveredAsState()
     val haptics = LocalHaptics.current
     val corner by animateDpAsState(
-        targetValue = if (pressed) 12.dp else 40.dp,
-        animationSpec = spring(dampingRatio = 0.5f, stiffness = 600f),
+        targetValue = when {
+            pressed -> 10.dp
+            hovered -> 28.dp
+            else -> 40.dp
+        },
+        animationSpec = spring(dampingRatio = 0.5f, stiffness = 500f),
         label = "corner"
     )
-    val scale by animateFloatAsState(
-        targetValue = if (pressed) 0.95f else 1f,
-        animationSpec = spring(dampingRatio = 0.45f, stiffness = 500f),
-        label = "scale"
+    val sx by animateFloatAsState(
+        targetValue = when {
+            pressed -> 0.94f
+            hovered -> 1.05f
+            else -> 1f
+        },
+        animationSpec = spring(dampingRatio = 0.35f, stiffness = 380f),
+        label = "scaleX"
     )
-    LaunchedEffect(pressed) { if (pressed) haptics.click() }
-    val shape = RoundedCornerShape(corner.coerceAtLeast(0.dp))
-    return shape to Modifier.graphicsLayer {
-        scaleX = scale
-        scaleY = scale
+    val sy by animateFloatAsState(
+        targetValue = when {
+            pressed -> 0.86f
+            hovered -> 1.05f
+            else -> 1f
+        },
+        animationSpec = spring(dampingRatio = 0.35f, stiffness = 380f),
+        label = "scaleY"
+    )
+    LaunchedEffect(pressed) {
+        if (pressed) haptics.click()
+        onPressChange?.invoke(pressed)
     }
+    return RoundedCornerShape(corner.coerceAtLeast(0.dp)) to Modifier.graphicsLayer {
+        scaleX = sx
+        scaleY = sy
+    }
+}
+
+/** The same squash and stretch for anything with an interaction source (FAB, nav items, cards). */
+@Composable
+fun Modifier.squish(interaction: MutableInteractionSource): Modifier {
+    val pressed by interaction.collectIsPressedAsState()
+    val hovered by interaction.collectIsHoveredAsState()
+    val sx by animateFloatAsState(
+        targetValue = when {
+            pressed -> 0.95f
+            hovered -> 1.03f
+            else -> 1f
+        },
+        animationSpec = spring(dampingRatio = 0.35f, stiffness = 380f),
+        label = "squishX"
+    )
+    val sy by animateFloatAsState(
+        targetValue = when {
+            pressed -> 0.90f
+            hovered -> 1.03f
+            else -> 1f
+        },
+        animationSpec = spring(dampingRatio = 0.35f, stiffness = 380f),
+        label = "squishY"
+    )
+    return this.graphicsLayer {
+        scaleX = sx
+        scaleY = sy
+    }
+}
+
+/** A clickable that squashes when pressed, swells on mouse hover and gives a haptic click. */
+@Composable
+fun Modifier.expressiveClickable(onClick: () -> Unit): Modifier {
+    val interaction = remember { MutableInteractionSource() }
+    val haptics = LocalHaptics.current
+    return this
+        .squish(interaction)
+        .clickable(
+            interactionSource = interaction,
+            indication = LocalIndication.current,
+            onClick = {
+                haptics.click()
+                onClick()
+            }
+        )
 }
 
 @Composable
@@ -209,10 +283,11 @@ fun ExpressiveButton(
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
     contentPadding: PaddingValues = ButtonDefaults.ContentPadding,
+    onPressChange: ((Boolean) -> Unit)? = null,
     content: @Composable RowScope.() -> Unit
 ) {
     val interaction = remember { MutableInteractionSource() }
-    val (shape, feel) = rememberExpressive(interaction)
+    val (shape, feel) = rememberExpressive(interaction, onPressChange)
     Button(
         onClick = onClick,
         modifier = modifier.then(feel),
@@ -233,10 +308,11 @@ fun ExpressiveTonalButton(
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
     contentPadding: PaddingValues = ButtonDefaults.ContentPadding,
+    onPressChange: ((Boolean) -> Unit)? = null,
     content: @Composable RowScope.() -> Unit
 ) {
     val interaction = remember { MutableInteractionSource() }
-    val (shape, feel) = rememberExpressive(interaction)
+    val (shape, feel) = rememberExpressive(interaction, onPressChange)
     FilledTonalButton(
         onClick = onClick,
         modifier = modifier.then(feel),
@@ -257,10 +333,11 @@ fun ExpressiveOutlinedButton(
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
     contentPadding: PaddingValues = ButtonDefaults.ContentPadding,
+    onPressChange: ((Boolean) -> Unit)? = null,
     content: @Composable RowScope.() -> Unit
 ) {
     val interaction = remember { MutableInteractionSource() }
-    val (shape, feel) = rememberExpressive(interaction)
+    val (shape, feel) = rememberExpressive(interaction, onPressChange)
     OutlinedButton(
         onClick = onClick,
         modifier = modifier.then(feel),
@@ -281,10 +358,11 @@ fun ExpressiveTextButton(
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
     contentPadding: PaddingValues = ButtonDefaults.TextButtonContentPadding,
+    onPressChange: ((Boolean) -> Unit)? = null,
     content: @Composable RowScope.() -> Unit
 ) {
     val interaction = remember { MutableInteractionSource() }
-    val (shape, feel) = rememberExpressive(interaction)
+    val (shape, feel) = rememberExpressive(interaction, onPressChange)
     TextButton(
         onClick = onClick,
         modifier = modifier.then(feel),
@@ -301,10 +379,11 @@ fun ExpressiveIconButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     tonal: Boolean = false,
+    onPressChange: ((Boolean) -> Unit)? = null,
     content: @Composable () -> Unit
 ) {
     val interaction = remember { MutableInteractionSource() }
-    val (shape, feel) = rememberExpressive(interaction)
+    val (shape, feel) = rememberExpressive(interaction, onPressChange)
     val scheme = MaterialTheme.colorScheme
     FilledTonalIconButton(
         onClick = onClick,
